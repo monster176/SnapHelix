@@ -1,0 +1,16 @@
+build/
+build-*/
+
+*.user
+*.pro.user
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.lib
+*.exp
+*.tlog
+*.lastbuildstate
+
+.vs/
+$null
