@@ -1,3 +1,4 @@
+#if 0
 #include "uiadetector.h"
 
 #include <QGuiApplication>
@@ -354,3 +355,8 @@ QRect UIADetector::getElementRectAt(const QPoint &globalPos, void *currentWindow
     bestElement->Release();
     return result;
 }
+#endif
+
+// Keep uiadetector.cpp as the translation-unit entry point while the
+// implementation stays in a separate file for easier incremental refactors.
+#include "uiadetector_impl.cpp"

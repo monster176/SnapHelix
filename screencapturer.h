@@ -36,6 +36,7 @@ public:
     static QList<ScreenCapturer *> createCapturers();
     static bool isCandidateWindow(void *handle, WId selfWinId);
     static QRect nativeWindowRectToLogical(void *handle);
+    static bool s_isCapturing;
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -63,6 +64,9 @@ private:
     bool shouldAcceptHoveredRect(const QRect &candidateRect) const;
     QRect logicalToDevice(const QRect &rect) const;
     QPoint logicalToDevice(const QPoint &point) const;
+    int hoverHandleAt(const QPoint &localPos) const;
+    void updateAdjustCursor(const QPoint &localPos);
+    QRect adjustedHoveredRect(const QPoint &localPos) const;
 
     void drawDesktop(QPainter &painter, const QRect &targetClip = QRect()) const;
     void drawSelectionOverlay(QPainter &painter, const QRect &selection);
@@ -87,8 +91,10 @@ private:
     QPoint m_mouseLocalPos;
     QPoint m_mouseGlobalPos;
     QPoint m_lastProbePos;
+    QPoint m_adjustPressPos;
 
     QRect m_hoveredRect;
+    QRect m_adjustStartRect;
     QElapsedTimer m_probeTimer;
     bool m_captureActive = false;
     bool m_dragging = false;
@@ -97,6 +103,9 @@ private:
     bool m_isController = false;
     bool m_isProbing = false;
     bool m_inputTransparent = false;
+    bool m_isCaptured = false;
+    bool m_isResizing = false;
+    int m_activeHandle = -1;
     int m_hotkeyId = 0x52F2;
 
     static QList<ScreenCapturer *> s_capturers;

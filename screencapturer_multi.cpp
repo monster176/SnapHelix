@@ -1,4 +1,5 @@
 #include "screencapturer.h"
+#include "coordinateconverter.h"
 #include "uiadetector.h"
 
 #include <QApplication>
@@ -19,7 +20,6 @@
 #include <QtMath>
 
 #include <algorithm>
-#include <limits>
 #include <utility>
 
 #include <Windows.h>
@@ -27,6 +27,7 @@
 
 QList<ScreenCapturer *> ScreenCapturer::s_capturers;
 QVector<ScreenCapturer::NativeWindowInfo> ScreenCapturer::s_windows;
+bool ScreenCapturer::s_isCapturing = false;
 
 namespace
 {
@@ -37,6 +38,17 @@ constexpr int kMagnifierSize = kMagnifierGrid * kMagnifierPixelSize;
 constexpr int kInfoPadding = 8;
 constexpr int kProbePixelThreshold = 5;
 constexpr qint64 kProbeIntervalMs = 40;
+constexpr int kAdjustMargin = 8;
+constexpr int kHandleNone = -1;
+constexpr int kHandleMove = 0;
+constexpr int kHandleLeft = 1;
+constexpr int kHandleTop = 2;
+constexpr int kHandleRight = 3;
+constexpr int kHandleBottom = 4;
+constexpr int kHandleTopLeft = 5;
+constexpr int kHandleTopRight = 6;
+constexpr int kHandleBottomLeft = 7;
+constexpr int kHandleBottomRight = 8;
 
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam)
 {
@@ -63,69 +75,20 @@ QRect inflateRect(const QRect &rect, int value)
     return rect.adjusted(-value, -value, value, value);
 }
 
-QRect physicalRectFromMonitorInfo(const MONITORINFO &monitorInfo)
+QRect clampAdjustedRect(const QRect &rect, const QRect &bounds)
 {
-    return QRect(monitorInfo.rcMonitor.left,
-                 monitorInfo.rcMonitor.top,
-                 monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
-                 monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top);
-}
-
-QRect physicalRectForScreen(const QScreen *screen)
-{
-    if (!screen) {
+    if (!rect.isValid() || bounds.isEmpty()) {
         return {};
     }
 
-    const QRect logicalGeometry = screen->geometry();
-    const qreal dpr = screen->devicePixelRatio();
-    return QRect(qRound(logicalGeometry.x() * dpr),
-                 qRound(logicalGeometry.y() * dpr),
-                 qRound(logicalGeometry.width() * dpr),
-                 qRound(logicalGeometry.height() * dpr));
+    QRect normalized = rect.normalized();
+    normalized.setLeft(qBound(bounds.left(), normalized.left(), bounds.right()));
+    normalized.setTop(qBound(bounds.top(), normalized.top(), bounds.bottom()));
+    normalized.setRight(qBound(bounds.left(), normalized.right(), bounds.right()));
+    normalized.setBottom(qBound(bounds.top(), normalized.bottom(), bounds.bottom()));
+    return normalized.normalized();
 }
 
-bool queryMonitorInfo(HMONITOR monitor, MONITORINFO &monitorInfo)
-{
-    if (!monitor) {
-        return false;
-    }
-
-    monitorInfo.cbSize = sizeof(MONITORINFO);
-    return GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
-}
-
-QScreen *screenForMonitor(HMONITOR monitor, QScreen *fallbackScreen)
-{
-    MONITORINFO monitorInfo{};
-    if (!queryMonitorInfo(monitor, monitorInfo)) {
-        return fallbackScreen ? fallbackScreen : QGuiApplication::primaryScreen();
-    }
-
-    const QRect monitorPhysicalRect = physicalRectFromMonitorInfo(monitorInfo);
-    QScreen *bestScreen = nullptr;
-    qint64 bestScore = std::numeric_limits<qint64>::max();
-
-    for (QScreen *screen : QGuiApplication::screens()) {
-        if (!screen) {
-            continue;
-        }
-
-        const QRect candidateRect = physicalRectForScreen(screen);
-        const qint64 score =
-            std::abs(candidateRect.x() - monitorPhysicalRect.x())
-            + std::abs(candidateRect.y() - monitorPhysicalRect.y())
-            + std::abs(candidateRect.width() - monitorPhysicalRect.width())
-            + std::abs(candidateRect.height() - monitorPhysicalRect.height());
-
-        if (!bestScreen || score < bestScore) {
-            bestScreen = screen;
-            bestScore = score;
-        }
-    }
-
-    return bestScreen ? bestScreen : (fallbackScreen ? fallbackScreen : QGuiApplication::primaryScreen());
-}
 } // namespace
 
 ScreenCapturer::ScreenCapturer(QScreen *screen, bool controllerInstance, QWidget *parent)
@@ -162,6 +125,7 @@ ScreenCapturer::ScreenCapturer(QScreen *screen, bool controllerInstance, QWidget
 ScreenCapturer::~ScreenCapturer()
 {
     s_capturers.removeAll(this);
+    s_isCapturing = false;
 
     if (m_isController) {
         unregisterHotkey();
@@ -203,6 +167,11 @@ bool ScreenCapturer::nativeEventFilter(const QByteArray &eventType, void *messag
     const auto *msg = static_cast<MSG *>(message);
     if (!msg || msg->message != WM_HOTKEY || static_cast<int>(msg->wParam) != m_hotkeyId) {
         return false;
+    }
+
+    if (ScreenCapturer::s_isCapturing) {
+        closeAllCaptures();
+        return true;
     }
 
     beginAllCaptures();
@@ -258,13 +227,43 @@ void ScreenCapturer::keyPressEvent(QKeyEvent *event)
 
 void ScreenCapturer::mousePressEvent(QMouseEvent *event)
 {
+    m_mouseLocalPos = event->position().toPoint();
+    m_mouseGlobalPos = event->globalPosition().toPoint();
+
+    if (event->button() == Qt::RightButton) {
+        m_isCaptured = false;
+        m_isResizing = false;
+        m_hoveredRect = {};
+        m_activeHandle = kHandleNone;
+        m_adjustPressPos = {};
+        m_adjustStartRect = {};
+        setCursor(Qt::CrossCursor);
+        update();
+        return;
+    }
+
     if (event->button() != Qt::LeftButton) {
         QWidget::mousePressEvent(event);
         return;
     }
 
-    m_mouseLocalPos = event->position().toPoint();
-    m_mouseGlobalPos = m_screenGeometry.topLeft() + m_mouseLocalPos;
+    const int handle = hoverHandleAt(m_mouseLocalPos);
+    if (m_hoveredRect.isValid() && !m_hoveredRect.isEmpty()) {
+        m_isCaptured = true;
+    }
+
+    if (handle != kHandleNone) {
+        m_isResizing = true;
+        m_activeHandle = handle;
+        m_adjustPressPos = m_mouseLocalPos;
+        m_adjustStartRect = m_hoveredRect;
+        m_isProbing = false;
+        setInputTransparent(false);
+        updateAdjustCursor(m_mouseLocalPos);
+        update();
+        return;
+    }
+
     m_dragging = true;
     m_hasSelection = true;
     m_dragStart = m_mouseLocalPos;
@@ -277,13 +276,32 @@ void ScreenCapturer::mouseMoveEvent(QMouseEvent *event)
     m_mouseLocalPos = event->position().toPoint();
     m_mouseGlobalPos = event->globalPosition().toPoint();
 
+    if (m_isCaptured && m_isResizing) {
+        const QRect adjustedRect = adjustedHoveredRect(m_mouseLocalPos);
+        if (adjustedRect.isValid() && !adjustedRect.isEmpty()) {
+            m_hoveredRect = adjustedRect;
+        }
+        updateAdjustCursor(m_mouseLocalPos);
+        update();
+        return;
+    }
+
+    if (m_isCaptured) {
+        updateAdjustCursor(m_mouseLocalPos);
+        return;
+    }
+
     if (m_dragging) {
         m_dragCurrent = m_mouseLocalPos;
         update();
         return;
     }
 
+    updateAdjustCursor(m_mouseLocalPos);
 
+    if (event->buttons() != Qt::NoButton) {
+        return;
+    }
 
     const QPoint delta = m_mouseGlobalPos - m_lastProbePos;
     if (std::abs(delta.x()) < kProbePixelThreshold && std::abs(delta.y()) < kProbePixelThreshold) {
@@ -316,6 +334,11 @@ void ScreenCapturer::mouseMoveEvent(QMouseEvent *event)
                                   [this, rect, probePos]() {
                                       setInputTransparent(false);
 
+                                      if (m_isCaptured) {
+                                          m_isProbing = false;
+                                          return;
+                                      }
+
                                       if (rect.isValid() && rect != m_hoveredRect) {
                                           const QRect candidateRect = uiaPhysicalRectToLocalLogical(rect);
                                           if (shouldAcceptHoveredRect(candidateRect)) {
@@ -340,10 +363,33 @@ void ScreenCapturer::mouseMoveEvent(QMouseEvent *event)
 
 void ScreenCapturer::mouseReleaseEvent(QMouseEvent *event)
 {
+    m_mouseLocalPos = event->position().toPoint();
+
+    if (event->button() == Qt::RightButton) {
+        return;
+    }
+
     if (event->button() != Qt::LeftButton) {
         QWidget::mouseReleaseEvent(event);
         return;
     }
+
+    if (m_isCaptured && m_isResizing) {
+        const QRect adjustedRect = adjustedHoveredRect(m_mouseLocalPos);
+        if (adjustedRect.isValid() && !adjustedRect.isEmpty()) {
+            m_hoveredRect = adjustedRect;
+        }
+        m_isResizing = false;
+        m_activeHandle = kHandleNone;
+        m_adjustPressPos = {};
+        m_adjustStartRect = {};
+        updateAdjustCursor(m_mouseLocalPos);
+        update();
+        return;
+    }
+
+    m_isCaptured = m_hoveredRect.isValid() && !m_hoveredRect.isEmpty();
+    m_isResizing = false;
 
     m_dragCurrent = event->position().toPoint();
     m_dragging = false;
@@ -391,8 +437,10 @@ void ScreenCapturer::unregisterHotkey()
 
 void ScreenCapturer::beginCapture()
 {
+    ScreenCapturer::s_isCapturing = true;
     refreshScreenSnapshot();
     if (!m_screen) {
+        ScreenCapturer::s_isCapturing = false;
         return;
     }
 
@@ -405,6 +453,11 @@ void ScreenCapturer::beginCapture()
     m_mouseGlobalPos = QCursor::pos();
     m_mouseLocalPos = m_mouseGlobalPos - m_screenGeometry.topLeft();
     m_lastProbePos = m_mouseGlobalPos;
+    m_adjustPressPos = {};
+    m_adjustStartRect = {};
+    m_isCaptured = false;
+    m_isResizing = false;
+    m_activeHandle = kHandleNone;
     m_probeTimer.restart();
 
     setGeometry(m_screenGeometry);
@@ -434,7 +487,13 @@ void ScreenCapturer::endCapture()
     m_dragStart = {};
     m_dragCurrent = {};
     m_isProbing = false;
+    m_adjustPressPos = {};
+    m_adjustStartRect = {};
+    m_isCaptured = false;
+    m_isResizing = false;
+    m_activeHandle = kHandleNone;
     setInputTransparent(false);
+    ScreenCapturer::s_isCapturing = false;
 }
 
 void ScreenCapturer::acceptCapture()
@@ -523,41 +582,7 @@ void ScreenCapturer::setInputTransparent(bool transparent)
 
 QRect ScreenCapturer::uiaPhysicalRectToLocalLogical(const QRect &globalPhysicalRect) const
 {
-    if (!m_screen || !globalPhysicalRect.isValid() || globalPhysicalRect.isEmpty()) {
-        return {};
-    }
-
-    const POINT physicalCenter{
-        globalPhysicalRect.center().x(),
-        globalPhysicalRect.center().y(),
-    };
-    const HMONITOR monitor = MonitorFromPoint(physicalCenter, MONITOR_DEFAULTTONEAREST);
-    QScreen *targetScreen = screenForMonitor(monitor, m_screen);
-    if (!targetScreen || targetScreen != m_screen) {
-        return {};
-    }
-
-    MONITORINFO monitorInfo{};
-    if (!queryMonitorInfo(monitor, monitorInfo)) {
-        return {};
-    }
-
-    const qreal dpr = targetScreen->devicePixelRatio();
-    if (dpr <= 0.0) {
-        return {};
-    }
-
-    const qreal physOriginX = static_cast<qreal>(monitorInfo.rcMonitor.left);
-    const qreal physOriginY = static_cast<qreal>(monitorInfo.rcMonitor.top);
-    const qreal localLeft = (static_cast<qreal>(globalPhysicalRect.x()) - physOriginX) / dpr;
-    const qreal localTop = (static_cast<qreal>(globalPhysicalRect.y()) - physOriginY) / dpr;
-    const qreal localWidth = static_cast<qreal>(globalPhysicalRect.width()) / dpr;
-    const qreal localHeight = static_cast<qreal>(globalPhysicalRect.height()) / dpr;
-
-    return QRect(qRound(localLeft),
-                 qRound(localTop),
-                 qRound(localWidth),
-                 qRound(localHeight));
+    return CoordinateConverter::physicalRectToLocalLogical(globalPhysicalRect, m_screen);
 }
 
 bool ScreenCapturer::shouldAcceptHoveredRect(const QRect &candidateRect) const
@@ -580,6 +605,125 @@ bool ScreenCapturer::shouldAcceptHoveredRect(const QRect &candidateRect) const
     const int areaDelta = std::abs(candidateArea - currentArea);
 
     return centerDelta > 6 || areaDelta > (currentArea / 5);
+}
+
+int ScreenCapturer::hoverHandleAt(const QPoint &localPos) const
+{
+    if (!m_hoveredRect.isValid() || m_hoveredRect.isEmpty()) {
+        return kHandleNone;
+    }
+
+    const QRect outer = inflateRect(m_hoveredRect, kAdjustMargin);
+    if (!outer.contains(localPos)) {
+        return kHandleNone;
+    }
+
+    const bool nearLeft = std::abs(localPos.x() - m_hoveredRect.left()) <= kAdjustMargin;
+    const bool nearRight = std::abs(localPos.x() - m_hoveredRect.right()) <= kAdjustMargin;
+    const bool nearTop = std::abs(localPos.y() - m_hoveredRect.top()) <= kAdjustMargin;
+    const bool nearBottom = std::abs(localPos.y() - m_hoveredRect.bottom()) <= kAdjustMargin;
+
+    if (nearLeft && nearTop) {
+        return kHandleTopLeft;
+    }
+    if (nearRight && nearTop) {
+        return kHandleTopRight;
+    }
+    if (nearLeft && nearBottom) {
+        return kHandleBottomLeft;
+    }
+    if (nearRight && nearBottom) {
+        return kHandleBottomRight;
+    }
+    if (nearLeft) {
+        return kHandleLeft;
+    }
+    if (nearRight) {
+        return kHandleRight;
+    }
+    if (nearTop) {
+        return kHandleTop;
+    }
+    if (nearBottom) {
+        return kHandleBottom;
+    }
+    if (m_hoveredRect.contains(localPos)) {
+        return kHandleMove;
+    }
+
+    return kHandleNone;
+}
+
+void ScreenCapturer::updateAdjustCursor(const QPoint &localPos)
+{
+    switch (hoverHandleAt(localPos)) {
+    case kHandleTopLeft:
+    case kHandleBottomRight:
+        setCursor(Qt::SizeFDiagCursor);
+        break;
+    case kHandleTopRight:
+    case kHandleBottomLeft:
+        setCursor(Qt::SizeBDiagCursor);
+        break;
+    case kHandleLeft:
+    case kHandleRight:
+        setCursor(Qt::SizeHorCursor);
+        break;
+    case kHandleTop:
+    case kHandleBottom:
+        setCursor(Qt::SizeVerCursor);
+        break;
+    case kHandleMove:
+        setCursor(Qt::SizeAllCursor);
+        break;
+    default:
+        setCursor(Qt::CrossCursor);
+        break;
+    }
+}
+
+QRect ScreenCapturer::adjustedHoveredRect(const QPoint &localPos) const
+{
+    if (!m_adjustStartRect.isValid() || m_adjustStartRect.isEmpty() || m_activeHandle == kHandleNone) {
+        return {};
+    }
+
+    QRect adjusted = m_adjustStartRect;
+    const QPoint delta = localPos - m_adjustPressPos;
+
+    switch (m_activeHandle) {
+    case kHandleMove:
+        adjusted.translate(delta);
+        break;
+    case kHandleLeft:
+        adjusted.setLeft(adjusted.left() + delta.x());
+        break;
+    case kHandleTop:
+        adjusted.setTop(adjusted.top() + delta.y());
+        break;
+    case kHandleRight:
+        adjusted.setRight(adjusted.right() + delta.x());
+        break;
+    case kHandleBottom:
+        adjusted.setBottom(adjusted.bottom() + delta.y());
+        break;
+    case kHandleTopLeft:
+        adjusted.setTopLeft(adjusted.topLeft() + delta);
+        break;
+    case kHandleTopRight:
+        adjusted.setTopRight(adjusted.topRight() + delta);
+        break;
+    case kHandleBottomLeft:
+        adjusted.setBottomLeft(adjusted.bottomLeft() + delta);
+        break;
+    case kHandleBottomRight:
+        adjusted.setBottomRight(adjusted.bottomRight() + delta);
+        break;
+    default:
+        break;
+    }
+
+    return clampAdjustedRect(adjusted, rect());
 }
 
 QRect ScreenCapturer::logicalToDevice(const QRect &rect) const
@@ -645,8 +789,8 @@ void ScreenCapturer::drawSelectionOverlay(QPainter &painter, const QRect &select
 void ScreenCapturer::drawHoverOverlay(QPainter &painter, const QRect &hoveredRect)
 {
     painter.save();
-    painter.setPen(QPen(QColor(255, 180, 0), 2, Qt::DashLine));
-    painter.setBrush(QColor(255, 180, 0, 32));
+    painter.setPen(QPen(QColor(0x20, 0x80, 0xF0), 2, Qt::SolidLine));
+    painter.setBrush(QColor(32, 128, 240, 40));
     painter.drawRect(hoveredRect);
     painter.restore();
 }
@@ -778,6 +922,11 @@ void ScreenCapturer::refreshVisibleWindows()
 
 void ScreenCapturer::beginAllCaptures()
 {
+    if (ScreenCapturer::s_isCapturing) {
+        closeAllCaptures();
+        return;
+    }
+
     refreshVisibleWindows();
     for (ScreenCapturer *capturer : s_capturers) {
         if (capturer) {

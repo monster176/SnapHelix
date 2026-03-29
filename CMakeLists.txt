@@ -16,10 +16,12 @@ qt_standard_project_setup()
 
 qt_add_executable(SnipasteLikeCapturer
     main.cpp
+    coordinateconverter.h
+    coordinateconverter.cpp
     screencapturer.h
     screencapturer_multi.cpp
     uiadetector.h
-    uiadetector_impl.cpp
+    uiadetector.cpp
 )
 
 target_link_libraries(SnipasteLikeCapturer

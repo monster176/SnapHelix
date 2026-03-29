@@ -3,13 +3,12 @@
 #endif
 
 #include "uiadetector.h"
+#include "coordinateconverter.h"
 
 #include <QGuiApplication>
 #include <QPoint>
 #include <QScreen>
 #include <QString>
-
-#include <limits>
 
 #include <Windows.h>
 #include <dwmapi.h>
@@ -129,70 +128,6 @@ bool isNearlyFullScreen(const QRect &physicalRect, const QRect &screenGeometry, 
                                    qRound(screenGeometry.height() * dpr));
     return physicalRect.width() * 100 >= screenPhysicalSize.width() * 90
            || physicalRect.height() * 100 >= screenPhysicalSize.height() * 90;
-}
-
-QRect physicalRectFromMonitorInfo(const MONITORINFO &monitorInfo)
-{
-    return QRect(monitorInfo.rcMonitor.left,
-                 monitorInfo.rcMonitor.top,
-                 monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
-                 monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top);
-}
-
-QRect physicalRectForScreen(const QScreen *screen)
-{
-    if (!screen) {
-        return {};
-    }
-
-    const QRect logicalGeometry = screen->geometry();
-    const qreal dpr = screen->devicePixelRatio();
-    return QRect(qRound(logicalGeometry.x() * dpr),
-                 qRound(logicalGeometry.y() * dpr),
-                 qRound(logicalGeometry.width() * dpr),
-                 qRound(logicalGeometry.height() * dpr));
-}
-
-bool queryMonitorInfo(HMONITOR monitor, MONITORINFO &monitorInfo)
-{
-    if (!monitor) {
-        return false;
-    }
-
-    monitorInfo.cbSize = sizeof(MONITORINFO);
-    return GetMonitorInfoW(monitor, &monitorInfo) != FALSE;
-}
-
-QScreen *screenForMonitor(HMONITOR monitor)
-{
-    MONITORINFO monitorInfo{};
-    if (!queryMonitorInfo(monitor, monitorInfo)) {
-        return QGuiApplication::primaryScreen();
-    }
-
-    const QRect monitorPhysicalRect = physicalRectFromMonitorInfo(monitorInfo);
-    QScreen *bestScreen = nullptr;
-    qint64 bestScore = std::numeric_limits<qint64>::max();
-
-    for (QScreen *screen : QGuiApplication::screens()) {
-        if (!screen) {
-            continue;
-        }
-
-        const QRect candidateRect = physicalRectForScreen(screen);
-        const qint64 score =
-            std::abs(candidateRect.x() - monitorPhysicalRect.x())
-            + std::abs(candidateRect.y() - monitorPhysicalRect.y())
-            + std::abs(candidateRect.width() - monitorPhysicalRect.width())
-            + std::abs(candidateRect.height() - monitorPhysicalRect.height());
-
-        if (!bestScreen || score < bestScore) {
-            bestScreen = screen;
-            bestScore = score;
-        }
-    }
-
-    return bestScreen ? bestScreen : QGuiApplication::primaryScreen();
 }
 
 bool isLargeContainer(CONTROLTYPEID controlType, const QRect &rect, const QRect &referenceRect)
@@ -342,15 +277,12 @@ QRect UIADetector::getElementRectAt(const QPoint &globalPos, void *currentWindow
         return {};
     }
 
-    const auto currentHwnd = static_cast<HWND>(currentWindowHandle);
-    HMONITOR monitor = currentHwnd ? MonitorFromWindow(currentHwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
-    if (!monitor) {
-        POINT fallbackPoint{globalPos.x(), globalPos.y()};
-        monitor = MonitorFromPoint(fallbackPoint, MONITOR_DEFAULTTONEAREST);
+    QScreen *screen = QGuiApplication::screenAt(globalPos);
+    if (!screen) {
+        screen = QGuiApplication::primaryScreen();
     }
-
-    MONITORINFO monitorInfo{};
-    if (!queryMonitorInfo(monitor, monitorInfo)) {
+    const QRect monitorRect = CoordinateConverter::monitorPhysicalRectForGlobalLogicalPoint(globalPos, screen);
+    if (!monitorRect.isValid()) {
         automation->Release();
         if (shouldUninitialize) {
             CoUninitialize();
@@ -358,7 +290,10 @@ QRect UIADetector::getElementRectAt(const QPoint &globalPos, void *currentWindow
         return {};
     }
 
-    QScreen *screen = screenForMonitor(monitor);
+    const auto currentHwnd = static_cast<HWND>(currentWindowHandle);
+    const QPoint physicalPointValue = CoordinateConverter::globalLogicalToPhysicalPoint(globalPos, screen);
+    POINT physicalPoint{physicalPointValue.x(), physicalPointValue.y()};
+
     if (!screen) {
         automation->Release();
         if (shouldUninitialize) {
@@ -367,26 +302,7 @@ QRect UIADetector::getElementRectAt(const QPoint &globalPos, void *currentWindow
         return {};
     }
 
-    qreal dpr = screen->devicePixelRatio();
-    QPoint screenOrigin = screen->geometry().topLeft();
-    POINT physicalPoint;
-    physicalPoint.x = static_cast<LONG>(
-        qRound((globalPos.x() - screenOrigin.x()) * dpr + monitorInfo.rcMonitor.left));
-    physicalPoint.y = static_cast<LONG>(
-        qRound((globalPos.y() - screenOrigin.y()) * dpr + monitorInfo.rcMonitor.top));
-
-    monitor = MonitorFromPoint(physicalPoint, MONITOR_DEFAULTTONEAREST);
-    if (queryMonitorInfo(monitor, monitorInfo)) {
-        screen = screenForMonitor(monitor);
-        if (screen) {
-            dpr = screen->devicePixelRatio();
-            screenOrigin = screen->geometry().topLeft();
-            physicalPoint.x = static_cast<LONG>(
-                qRound((globalPos.x() - screenOrigin.x()) * dpr + monitorInfo.rcMonitor.left));
-            physicalPoint.y = static_cast<LONG>(
-                qRound((globalPos.y() - screenOrigin.y()) * dpr + monitorInfo.rcMonitor.top));
-        }
-    }
+    const qreal dpr = screen->devicePixelRatio();
 
     const HWND underCursor = WindowFromPoint(physicalPoint);
     if (!underCursor || underCursor == currentHwnd || isSelfOrChildWindow(underCursor, currentHwnd)) {
@@ -408,7 +324,7 @@ QRect UIADetector::getElementRectAt(const QPoint &globalPos, void *currentWindow
     const QRect currentWindowRect = hwndRect(currentHwnd);
     const QRect referenceRect = currentWindowRect.isValid()
                                     ? currentWindowRect
-                                    : physicalRectFromMonitorInfo(monitorInfo);
+                                    : monitorRect;
 
     IUIAutomationCacheRequest *cacheRequest = nullptr;
     if (FAILED(automation->CreateCacheRequest(&cacheRequest)) || !cacheRequest) {
@@ -519,7 +435,7 @@ QRect UIADetector::getElementRectAt(const QPoint &globalPos, void *currentWindow
         }
     }
 
-    if (isNearlyFullScreen(result, physicalRectFromMonitorInfo(monitorInfo), 1.0)) {
+    if (isNearlyFullScreen(result, monitorRect, 1.0)) {
         result = {};
     }
 
