@@ -15,14 +15,16 @@ find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Concurrent)
 qt_standard_project_setup()
 
 qt_add_executable(SnipasteLikeCapturer
-    main.cpp
-    coordinateconverter.h
-    coordinateconverter.cpp
-    screencapturer.h
-    screencapturer_multi.cpp
-    uiadetector.h
-    uiadetector.cpp
+    src/main.cpp
+    include/coordinateconverter.h
+    src/coordinateconverter.cpp
+    include/screencapturer.h
+    src/screencapturer_multi.cpp
+    include/uiadetector.h
+    src/uiadetector.cpp
 )
+
+target_include_directories(SnipasteLikeCapturer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_link_libraries(SnipasteLikeCapturer
     PRIVATE
