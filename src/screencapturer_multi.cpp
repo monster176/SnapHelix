@@ -20,6 +20,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPainterPathStroker>
 #include <QPen>
 #include <QScreen>
 #include <QShowEvent>
@@ -73,6 +74,8 @@ constexpr int kPaletteSwatchGap = 4;
 constexpr int kPaletteInnerPadding = 6;
 constexpr int kSelectionHandleRadius = 4;
 constexpr int kAnnotationPenWidth = 3;
+constexpr int kDefaultBlurBrushDiameter = 28;
+constexpr int kDefaultEraserBrushDiameter = 34;
 constexpr int kPinnedFramePadding = 4;
 constexpr int kInlineTextBoxWidth = 220;
 constexpr int kInlineTextBoxHeight = 34;
@@ -88,6 +91,8 @@ constexpr ToolbarVisualItem kToolbarItems[] = {
     {ScreenCapturer::Tool_Draw, false},
     {ScreenCapturer::Tool_Text, false},
     {ScreenCapturer::Tool_Arrow, false},
+    {ScreenCapturer::Tool_Blur, false},
+    {ScreenCapturer::Tool_Eraser, false},
     {ScreenCapturer::Tool_Rectangle, false},
     {ScreenCapturer::Tool_Ellipse, false},
     {ScreenCapturer::Tool_Undo, false},
@@ -135,12 +140,21 @@ bool isAnnotationTool(ScreenCapturer::ToolType tool)
     case ScreenCapturer::Tool_Draw:
     case ScreenCapturer::Tool_Text:
     case ScreenCapturer::Tool_Arrow:
+    case ScreenCapturer::Tool_Blur:
+    case ScreenCapturer::Tool_Eraser:
     case ScreenCapturer::Tool_Rectangle:
     case ScreenCapturer::Tool_Ellipse:
         return true;
     default:
         return false;
     }
+}
+
+bool isBrushTool(ScreenCapturer::ToolType tool)
+{
+    return tool == ScreenCapturer::Tool_Draw
+           || tool == ScreenCapturer::Tool_Blur
+           || tool == ScreenCapturer::Tool_Eraser;
 }
 
 bool isNearFullScreenRect(const QRect &candidate, const QRect &bounds)
@@ -153,6 +167,24 @@ bool isNearFullScreenRect(const QRect &candidate, const QRect &bounds)
            && std::abs(candidate.top() - bounds.top()) <= 2
            && std::abs(candidate.right() - bounds.right()) <= 2
            && std::abs(candidate.bottom() - bounds.bottom()) <= 2;
+}
+
+QPainterPath buildStrokePath(const QVector<QPointF> &points, qreal width)
+{
+    if (points.isEmpty()) {
+        return {};
+    }
+
+    QPainterPath path(points.first());
+    for (int i = 1; i < points.size(); ++i) {
+        path.lineTo(points[i]);
+    }
+
+    QPainterPathStroker stroker;
+    stroker.setWidth(width);
+    stroker.setCapStyle(Qt::RoundCap);
+    stroker.setJoinStyle(Qt::RoundJoin);
+    return stroker.createStroke(path);
 }
 
 void drawSelectionHandles(QPainter &painter, const QRect &selection)
@@ -188,6 +220,10 @@ QString toolDisplayName(ScreenCapturer::ToolType tool)
         return QStringLiteral("文字");
     case ScreenCapturer::Tool_Arrow:
         return QStringLiteral("箭头");
+    case ScreenCapturer::Tool_Blur:
+        return QStringLiteral("模糊");
+    case ScreenCapturer::Tool_Eraser:
+        return QStringLiteral("橡皮擦");
     case ScreenCapturer::Tool_Rectangle:
         return QStringLiteral("矩形");
     case ScreenCapturer::Tool_Ellipse:
@@ -450,6 +486,26 @@ void drawToolbarGlyph(QPainter &painter, ScreenCapturer::ToolType tool, const QR
         painter.drawLine(QPointF(right - 3.5, top + 3.0), QPointF(right - 4.6, top + 7.2));
         break;
     }
+    case ScreenCapturer::Tool_Blur: {
+        const QRectF blurRect(left + 1.0, top + 1.0, right - left - 2.0, bottom - top - 2.0);
+        painter.drawRect(blurRect);
+        for (int x = 0; x < 3; ++x) {
+            for (int y = 0; y < 3; ++y) {
+                const qreal w = 3.0;
+                const qreal h = 2.6;
+                const qreal px = blurRect.left() + 1.4 + x * 4.0 + (y % 2 == 0 ? 0.0 : 0.6);
+                const qreal py = blurRect.top() + 1.6 + y * 3.4;
+                painter.fillRect(QRectF(px, py, w, h), QColor(0x3a, 0x3a, 0x3a, 90));
+            }
+        }
+        break;
+    }
+    case ScreenCapturer::Tool_Eraser: {
+        painter.drawEllipse(QRectF(left + 2.0, top + 2.0, 6.0, 6.0));
+        painter.drawLine(QPointF(left + 6.5, top + 8.0), QPointF(right - 0.8, bottom - 0.8));
+        painter.drawLine(QPointF(left + 5.0, top + 9.3), QPointF(left + 8.0, top + 6.3));
+        break;
+    }
     case ScreenCapturer::Tool_Rectangle: {
         const qreal s = 5.2;
         painter.drawRect(QRectF(left, top, s, s));
@@ -632,8 +688,18 @@ bool ScreenCapturer::nativeEventFilter(const QByteArray &eventType, void *messag
     }
 
     const auto *msg = static_cast<MSG *>(message);
-    if (!msg || msg->message != WM_HOTKEY || static_cast<int>(msg->wParam) != m_hotkeyId) {
+    if (!msg || msg->message != WM_HOTKEY) {
         return false;
+    }
+
+    const int hotkeyId = static_cast<int>(msg->wParam);
+    if (hotkeyId != m_hotkeyId && hotkeyId != m_clipboardHotkeyId) {
+        return false;
+    }
+
+    if (hotkeyId == m_clipboardHotkeyId) {
+        pinClipboardImage();
+        return true;
     }
 
     if (ScreenCapturer::s_isCapturing) {
@@ -681,7 +747,23 @@ void ScreenCapturer::paintEvent(QPaintEvent *event)
         }
     }
 
-    drawMagnifier(painter);
+    if (m_selectedTool == Tool_Select) {
+        drawMagnifier(painter);
+    }
+
+    if (isBrushTool(m_selectedTool) && rect().contains(m_mouseLocalPos)) {
+        const int diameter = currentBrushDiameter();
+        const int radius = diameter / 2;
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(QPen(QColor(0, 0, 0, 180), 0.9));
+        painter.setBrush(QColor(255, 255, 255, 18));
+        painter.drawEllipse(m_mouseLocalPos, radius, radius);
+        painter.setPen(QPen(QColor(255, 255, 255, 235), 1.0));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(m_mouseLocalPos, radius - 1, radius - 1);
+        painter.restore();
+    }
 }
 
 void ScreenCapturer::showEvent(QShowEvent *event)
@@ -720,6 +802,21 @@ void ScreenCapturer::keyPressEvent(QKeyEvent *event)
     }
 
     QWidget::keyPressEvent(event);
+}
+
+void ScreenCapturer::wheelEvent(QWheelEvent *event)
+{
+    if (isBrushTool(m_selectedTool)) {
+        const int deltaY = event->angleDelta().y() != 0 ? event->angleDelta().y() : event->pixelDelta().y();
+        if (deltaY != 0) {
+            adjustCurrentBrushDiameter(deltaY > 0 ? 1 : -1);
+            update();
+            event->accept();
+            return;
+        }
+    }
+
+    QWidget::wheelEvent(event);
 }
 
 void ScreenCapturer::mousePressEvent(QMouseEvent *event)
@@ -1041,7 +1138,9 @@ void ScreenCapturer::registerHotkey()
         return;
     }
 
-    m_hotkeyRegistered = RegisterHotKey(nullptr, m_hotkeyId, MOD_NOREPEAT, VK_F2);
+    const bool captureRegistered = RegisterHotKey(nullptr, m_hotkeyId, MOD_NOREPEAT, VK_F2);
+    const bool clipboardRegistered = RegisterHotKey(nullptr, m_clipboardHotkeyId, MOD_ALT | MOD_NOREPEAT, 'S');
+    m_hotkeyRegistered = captureRegistered && clipboardRegistered;
 }
 
 void ScreenCapturer::unregisterHotkey()
@@ -1051,6 +1150,7 @@ void ScreenCapturer::unregisterHotkey()
     }
 
     UnregisterHotKey(nullptr, m_hotkeyId);
+    UnregisterHotKey(nullptr, m_clipboardHotkeyId);
     m_hotkeyRegistered = false;
 }
 
@@ -1305,7 +1405,15 @@ void ScreenCapturer::updateAdjustCursor(const QPoint &localPos)
         setCursor(Qt::SizeVerCursor);
         break;
     default:
-        setCursor(m_selectedTool == Tool_Select ? Qt::ArrowCursor : Qt::CrossCursor);
+        if (m_selectedTool == Tool_Text) {
+            setCursor(Qt::IBeamCursor);
+        } else if (m_selectedTool == Tool_Draw || m_selectedTool == Tool_Blur || m_selectedTool == Tool_Eraser) {
+            setCursor(Qt::BlankCursor);
+        } else if (m_selectedTool == Tool_Select) {
+            setCursor(Qt::ArrowCursor);
+        } else {
+            setCursor(Qt::ArrowCursor);
+        }
         break;
     }
 }
@@ -1427,7 +1535,7 @@ void ScreenCapturer::drawHoverOverlay(QPainter &painter, const QRect &hoveredRec
 
 void ScreenCapturer::drawMagnifier(QPainter &painter)
 {
-    if (!rect().contains(m_mouseLocalPos)) {
+    if (m_selectedTool != Tool_Select || !rect().contains(m_mouseLocalPos)) {
         return;
     }
 
@@ -1646,7 +1754,7 @@ void ScreenCapturer::handleToolClick(ToolType tool)
         break;
     case Tool_Draw:
         m_selectedTool = Tool_Draw;
-        setCursor(Qt::CrossCursor);
+        setCursor(Qt::BlankCursor);
         break;
     case Tool_Text:
         m_selectedTool = Tool_Text;
@@ -1655,6 +1763,14 @@ void ScreenCapturer::handleToolClick(ToolType tool)
     case Tool_Arrow:
         m_selectedTool = Tool_Arrow;
         setCursor(Qt::CrossCursor);
+        break;
+    case Tool_Blur:
+        m_selectedTool = Tool_Blur;
+        setCursor(Qt::BlankCursor);
+        break;
+    case Tool_Eraser:
+        m_selectedTool = Tool_Eraser;
+        setCursor(Qt::BlankCursor);
         break;
     case Tool_Rectangle:
         m_selectedTool = Tool_Rectangle;
@@ -1765,11 +1881,20 @@ bool ScreenCapturer::beginAnnotationInteraction(const QPoint &localPos)
 
     if (m_selectedTool == Tool_Draw) {
         m_annotationPreview.kind = Annotation::Path;
+        m_annotationPreview.width = m_drawBrushDiameter;
         m_annotationPreview.points = {QPointF(mapToSelection(localPos))};
     } else if (m_selectedTool == Tool_Arrow) {
         m_annotationPreview.kind = Annotation::Arrow;
         const QPointF anchor = QPointF(mapToSelection(localPos));
         m_annotationPreview.points = {anchor, anchor};
+    } else if (m_selectedTool == Tool_Blur) {
+        m_annotationPreview.kind = Annotation::Blur;
+        m_annotationPreview.width = m_blurBrushDiameter;
+        m_annotationPreview.points = {QPointF(mapToSelection(localPos))};
+    } else if (m_selectedTool == Tool_Eraser) {
+        m_annotationPreview.kind = Annotation::Erase;
+        m_annotationPreview.width = m_eraserBrushDiameter;
+        m_annotationPreview.points = {QPointF(mapToSelection(localPos))};
     } else if (m_selectedTool == Tool_Rectangle) {
         m_annotationPreview.kind = Annotation::Rectangle;
         m_annotationPreview.rect = mapRectToSelection(m_annotationPreviewRect);
@@ -1792,6 +1917,11 @@ void ScreenCapturer::updateAnnotationInteraction(const QPoint &localPos)
                             qBound(selection.top(), localPos.y(), selection.bottom()));
 
     if (m_selectedTool == Tool_Draw) {
+        m_annotationPreview.points.push_back(QPointF(mapToSelection(boundedPos)));
+        return;
+    }
+
+    if (m_selectedTool == Tool_Blur || m_selectedTool == Tool_Eraser) {
         m_annotationPreview.points.push_back(QPointF(mapToSelection(boundedPos)));
         return;
     }
@@ -1822,6 +1952,8 @@ void ScreenCapturer::finishAnnotationInteraction(const QPoint &localPos)
 
     bool shouldCommit = false;
     if (m_annotationPreview.kind == Annotation::Path) {
+        shouldCommit = m_annotationPreview.points.size() > 1;
+    } else if (m_annotationPreview.kind == Annotation::Blur || m_annotationPreview.kind == Annotation::Erase) {
         shouldCommit = m_annotationPreview.points.size() > 1;
     } else if (m_annotationPreview.kind == Annotation::Arrow) {
         shouldCommit = m_annotationPreview.points.size() >= 2
@@ -1865,7 +1997,8 @@ void ScreenCapturer::drawAnnotation(QPainter &painter, const QRect &selection, c
 {
     painter.save();
     painter.setClipRect(selection.adjusted(1, 1, -1, -1));
-    painter.setPen(QPen(annotation.color, kAnnotationPenWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    const qreal strokeWidth = annotation.width > 0.0 ? annotation.width : kAnnotationPenWidth;
+    painter.setPen(QPen(annotation.color, strokeWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     painter.setBrush(Qt::NoBrush);
 
     switch (annotation.kind) {
@@ -1900,6 +2033,70 @@ void ScreenCapturer::drawAnnotation(QPainter &painter, const QRect &selection, c
             painter.setBrush(annotation.color);
             painter.drawPolygon(QPolygonF({end, arrowP1, arrowP2}));
         }
+        break;
+    }
+    case Annotation::Blur: {
+        if (annotation.points.size() < 2) {
+            break;
+        }
+
+        const QPainterPath strokePath = buildStrokePath(annotation.points,
+                                                        annotation.width > 0.0 ? annotation.width : kDefaultBlurBrushDiameter);
+        const QRect blurRect = strokePath.boundingRect().toAlignedRect().intersected(selection);
+        if (!blurRect.isValid() || blurRect.isEmpty()) {
+            break;
+        }
+
+        const QRect deviceRect = logicalToDevice(blurRect);
+        if (!deviceRect.isValid() || deviceRect.isEmpty()) {
+            break;
+        }
+
+        const QImage source = m_currentScreenImage.copy(deviceRect);
+        if (source.isNull()) {
+            break;
+        }
+
+        const QSize downscaledSize(std::max(1, blurRect.width() / 12),
+                                   std::max(1, blurRect.height() / 12));
+        const QImage coarse = source.scaled(downscaledSize,
+                                            Qt::IgnoreAspectRatio,
+                                            Qt::FastTransformation);
+        const QImage blurred = coarse.scaled(blurRect.size(),
+                                             Qt::IgnoreAspectRatio,
+                                             Qt::FastTransformation);
+        painter.save();
+        painter.setClipPath(strokePath);
+        painter.drawImage(blurRect, blurred);
+        painter.restore();
+        break;
+    }
+    case Annotation::Erase: {
+        if (annotation.points.size() < 2) {
+            break;
+        }
+
+        const QPainterPath strokePath = buildStrokePath(annotation.points,
+                                                        annotation.width > 0.0 ? annotation.width : kDefaultEraserBrushDiameter);
+        const QRect eraseRect = strokePath.boundingRect().toAlignedRect().intersected(selection);
+        if (!eraseRect.isValid() || eraseRect.isEmpty()) {
+            break;
+        }
+
+        const QRect deviceRect = logicalToDevice(eraseRect);
+        if (!deviceRect.isValid() || deviceRect.isEmpty()) {
+            break;
+        }
+
+        const QImage source = m_currentScreenImage.copy(deviceRect);
+        if (source.isNull()) {
+            break;
+        }
+
+        painter.save();
+        painter.setClipPath(strokePath);
+        painter.drawImage(eraseRect, source);
+        painter.restore();
         break;
     }
     case Annotation::Rectangle:
@@ -2104,6 +2301,38 @@ void ScreenCapturer::showCopyToast(const QString &text)
     m_copyToastTimer->start(2000);
 }
 
+int ScreenCapturer::currentBrushDiameter() const
+{
+    switch (m_selectedTool) {
+    case Tool_Draw:
+        return m_drawBrushDiameter;
+    case Tool_Blur:
+        return m_blurBrushDiameter;
+    case Tool_Eraser:
+        return m_eraserBrushDiameter;
+    default:
+        return 0;
+    }
+}
+
+void ScreenCapturer::adjustCurrentBrushDiameter(int deltaSteps)
+{
+    const int delta = deltaSteps * 2;
+    switch (m_selectedTool) {
+    case Tool_Draw:
+        m_drawBrushDiameter = qBound(4, m_drawBrushDiameter + delta, 80);
+        break;
+    case Tool_Blur:
+        m_blurBrushDiameter = qBound(8, m_blurBrushDiameter + delta, 120);
+        break;
+    case Tool_Eraser:
+        m_eraserBrushDiameter = qBound(8, m_eraserBrushDiameter + delta, 120);
+        break;
+    default:
+        break;
+    }
+}
+
 void ScreenCapturer::pinSelection()
 {
     commitTextEditing();
@@ -2118,15 +2347,55 @@ void ScreenCapturer::pinSelection()
         selection = m_hoveredRect;
     }
 
-    auto *window = new PinnedPreviewWidget(image);
-    if (selection.isValid() && !selection.isEmpty()) {
-        const QPoint globalTopLeft = m_screenGeometry.topLeft() + selection.topLeft() - QPoint(kPinnedFramePadding, kPinnedFramePadding);
-        window->move(globalTopLeft);
-    } else {
-        window->move(QCursor::pos());
+    const QPoint globalTopLeft = selection.isValid() && !selection.isEmpty()
+                                     ? (m_screenGeometry.topLeft() + selection.topLeft()
+                                        - QPoint(kPinnedFramePadding, kPinnedFramePadding))
+                                     : QCursor::pos();
+    pinImage(image, globalTopLeft);
+}
+
+void ScreenCapturer::pinImage(const QImage &image, const QPoint &globalPositionHint, bool centerOnHint)
+{
+    if (image.isNull()) {
+        return;
     }
+
+    auto *window = new PinnedPreviewWidget(image);
+    QPoint targetPos = globalPositionHint.isNull() ? QCursor::pos() : globalPositionHint;
+    if (centerOnHint) {
+        const QSize windowSize = window->size();
+        targetPos -= QPoint(windowSize.width() / 2, windowSize.height() / 2);
+    }
+    window->move(targetPos);
     window->show();
     m_pinnedWindows.push_back(window);
+}
+
+void ScreenCapturer::pinClipboardImage()
+{
+    const QImage image = qApp->clipboard()->image();
+    if (image.isNull()) {
+        return;
+    }
+
+    ScreenCapturer *targetCapturer = nullptr;
+    const QPoint cursorPos = QCursor::pos();
+    for (ScreenCapturer *capturer : s_capturers) {
+        if (capturer && capturer->m_screenGeometry.contains(cursorPos)) {
+            targetCapturer = capturer;
+            break;
+        }
+    }
+
+    if (!targetCapturer && !s_capturers.isEmpty()) {
+        targetCapturer = s_capturers.first();
+    }
+
+    if (!targetCapturer) {
+        return;
+    }
+
+    targetCapturer->pinImage(image, cursorPos, true);
 }
 
 QImage ScreenCapturer::renderSelectionImage(bool includeDevicePixelRatio) const

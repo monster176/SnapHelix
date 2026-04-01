@@ -23,6 +23,7 @@ class QPainter;
 class QPainterPath;
 class QScreen;
 class QShowEvent;
+class QWheelEvent;
 class QWidget;
 
 class ScreenCapturer final : public QWidget, public QAbstractNativeEventFilter
@@ -41,6 +42,8 @@ public:
         Tool_Text,
         Tool_ColorPicker,
         Tool_Arrow,
+        Tool_Blur,
+        Tool_Eraser,
         Tool_Rectangle,
         Tool_Ellipse,
         Tool_Undo,
@@ -66,6 +69,7 @@ protected:
     void paintEvent(QPaintEvent *event) override;
     void showEvent(QShowEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
@@ -76,6 +80,8 @@ private:
         enum Kind {
             Path,
             Arrow,
+            Blur,
+            Erase,
             Rectangle,
             Ellipse,
             Text
@@ -83,6 +89,7 @@ private:
 
         Kind kind;
         QColor color;
+        qreal width = 0.0;
         QVector<QPointF> points;
         QRect rect;
         QString text;
@@ -141,14 +148,18 @@ private:
     void copySelectionToClipboard();
     bool saveSelectionToFile();
     void pinSelection();
+    void pinImage(const QImage &image, const QPoint &globalPositionHint = QPoint(), bool centerOnHint = false);
     void beginTextEditing(const QPoint &localPos);
     void commitTextEditing();
     void cancelTextEditing();
     void showCopyToast(const QString &text);
+    int currentBrushDiameter() const;
+    void adjustCurrentBrushDiameter(int deltaSteps);
     QImage renderSelectionImage(bool includeDevicePixelRatio = true) const;
 
     QImage extractSelectionImage(const QRect &localLogicalSelection) const;
     QColor sampleColor(const QPoint &localLogicalPos) const;
+    static void pinClipboardImage();
 
     static void refreshVisibleWindows();
     static void beginAllCaptures();
@@ -186,15 +197,19 @@ private:
     bool m_ignoreNextMouseRelease = false;
     int m_activeHandle = -1;
     int m_hotkeyId = 0x52F2;
+    int m_clipboardHotkeyId = 0x52F3;
     bool m_showToolbar = false;
     QVector<ToolButton> m_toolButtons;
     QVector<ColorSwatchButton> m_colorButtons;
     ToolType m_selectedTool = Tool_Select;
     ToolType m_hoveredToolbarTool = Tool_COUNT;
     QColor m_annotationColor = QColor(255, 59, 48);
+    int m_drawBrushDiameter = 10;
+    int m_blurBrushDiameter = 28;
+    int m_eraserBrushDiameter = 34;
     QVector<Annotation> m_annotations;
     QVector<Annotation> m_redoAnnotations;
-    Annotation m_annotationPreview{Annotation::Path, QColor(255, 59, 48), {}, {}, {}, {}};
+    Annotation m_annotationPreview{Annotation::Path, QColor(255, 59, 48), 0.0, {}, {}, {}, {}};
     QPointer<QLineEdit> m_textEditor;
     QPointer<QLabel> m_copyToastLabel;
     QTimer *m_copyToastTimer = nullptr;
